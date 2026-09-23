@@ -7,12 +7,14 @@
 
 ## One-command install
 
-### npm (recommended)
+### npm
 
 ```bash
-npm install -g myagent
+npm install -g github:TitanSarim/myagent
 myagent
 ```
+
+(Once published to the npm registry: `npm install -g myagent`)
 
 ### curl (Linux / macOS)
 

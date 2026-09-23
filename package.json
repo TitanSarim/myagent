@@ -26,20 +26,15 @@
     "myagent": "npm/bin/myagent.js"
   },
   "scripts": {
-    "postinstall": "node npm/install.js"
+    "postinstall": "node install.js"
   },
   "engines": {
     "node": ">=16"
   },
   "preferGlobal": true,
   "files": [
-    "npm/bin/",
-    "npm/install.js",
-    "cmd/",
-    "internal/",
-    "prompts/",
-    "go.mod",
-    "go.sum",
+    "install.js",
+    "npm/bin/myagent.js",
     "LICENSE",
     "README.md"
   ]
