@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -10,30 +9,50 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sarim/localcode/internal/agent"
-	"github.com/sarim/localcode/internal/config"
-	"github.com/sarim/localcode/internal/provider"
-	"github.com/sarim/localcode/internal/repo"
-	"github.com/sarim/localcode/internal/router"
-	"github.com/sarim/localcode/internal/tools"
-	"github.com/sarim/localcode/internal/ui"
+	"github.com/TitanSarim/myagent/internal/agent"
+	"github.com/TitanSarim/myagent/internal/config"
+	"github.com/TitanSarim/myagent/internal/provider"
+	"github.com/TitanSarim/myagent/internal/repo"
+	"github.com/TitanSarim/myagent/internal/router"
+	"github.com/TitanSarim/myagent/internal/session"
+	"github.com/TitanSarim/myagent/internal/tools"
+	"github.com/TitanSarim/myagent/internal/tui"
+	"github.com/TitanSarim/myagent/internal/ui"
 	"github.com/spf13/cobra"
 )
 
 var (
+	version = "0.4.0-m8"
+	// appName is the installed command name (overridable via LOCALCODE_NAME).
+	appName = "localcode"
+
 	flagMode    string
 	flagModel   string
 	flagContext int
 	flagVerbose bool
 	flagURL     string
 	flagNoTools bool
+	flagYes     bool
+	flagDryRun  bool
+	flagNoShell bool
+	flagWrite   bool
 )
 
+func appDisplayName() string {
+	if n := os.Getenv("LOCALCODE_NAME"); n != "" {
+		return n
+	}
+	return appName
+}
+
 func main() {
+	if n := os.Getenv("LOCALCODE_NAME"); n != "" {
+		appName = n
+	}
 	root := &cobra.Command{
-		Use:   "localcode",
+		Use:   appName,
 		Short: "Local AI coding CLI (Ollama + Qwen)",
-		Long:  "LocalCode — local coding agent CLI powered by Qwen models via Ollama.",
+		Long:  appName + " — local coding agent. Run with no args to open the terminal UI.",
 		RunE:  runChat,
 	}
 
@@ -43,12 +62,20 @@ func main() {
 	root.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "Verbose output")
 	root.PersistentFlags().StringVar(&flagURL, "provider-url", "", "Override Ollama base URL")
 	root.PersistentFlags().BoolVar(&flagNoTools, "no-tools", false, "Disable repository tools")
+	root.PersistentFlags().BoolVar(&flagYes, "yes", false, "Auto-approve patches and approval-gated commands")
+	root.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "Validate patches but do not write files")
+	root.PersistentFlags().BoolVar(&flagNoShell, "no-shell", false, "Disable run_command/run_tests")
+	root.PersistentFlags().BoolVar(&flagWrite, "write", false, "Enable write tools in chat/ask (edit/fix enable this by default)")
 
 	root.AddCommand(
 		newAskCmd(),
 		newChatCmd(),
 		newExplainCmd(),
+		newPlanCmd(),
+		newEditCmd(),
+		newFixCmd(),
 		newReviewCmd(),
+		newTestCmd(),
 		newModelsCmd(),
 		newStatusCmd(),
 		newInitCmd(),
@@ -61,14 +88,16 @@ func main() {
 }
 
 type runtimeEnv struct {
-	cfg    *config.Config
-	prov   provider.Provider
-	router *router.Router
-	repo   *repo.Repo
-	tools  *tools.Registry
+	cfg      *config.Config
+	prov     provider.Provider
+	router   *router.Router
+	repo     *repo.Repo
+	tools    *tools.Registry
+	session  *session.Store
+	writable bool
 }
 
-func loadRuntime() (*runtimeEnv, error) {
+func loadRuntime(writable bool) (*runtimeEnv, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, err
@@ -79,12 +108,42 @@ func loadRuntime() (*runtimeEnv, error) {
 	p := provider.NewOllama(cfg.Provider.BaseURL)
 	r := router.New(cfg)
 
-	env := &runtimeEnv{cfg: cfg, prov: p, router: r}
-	if !flagNoTools {
-		if rp, err := repo.Find(""); err == nil {
-			env.repo = rp
-			env.tools = tools.NewReadOnly(rp)
+	env := &runtimeEnv{cfg: cfg, prov: p, router: r, writable: writable}
+
+	dataDir, _ := config.DataDir()
+	if dataDir != "" {
+		if store, err := session.New(dataDir); err == nil {
+			env.session = store
 		}
+	}
+
+	if flagNoTools {
+		return env, nil
+	}
+	rp, err := repo.Find("")
+	if err != nil {
+		return env, nil
+	}
+	env.repo = rp
+
+	approve := tools.DefaultApprover(flagYes)
+	patchDir := ""
+	if env.session != nil {
+		patchDir = env.session.PatchDir()
+	}
+
+	if writable {
+		env.tools = tools.NewAgentTools(tools.Options{
+			Repo:     rp,
+			Cfg:      cfg,
+			Approve:  approve,
+			Writable: true,
+			DryRun:   flagDryRun,
+			NoShell:  flagNoShell,
+			Session:  patchDir,
+		})
+	} else {
+		env.tools = tools.NewReadOnly(rp)
 	}
 	return env, nil
 }
@@ -96,7 +155,10 @@ func (e *runtimeEnv) agent() *agent.Agent {
 		Config:   e.cfg,
 		Repo:     e.repo,
 		Tools:    e.tools,
+		Session:  e.session,
 		Verbose:  flagVerbose,
+		Writable: e.writable,
+		DryRun:   flagDryRun,
 	}
 }
 
@@ -107,29 +169,35 @@ func modeOrDefault(cfg *config.Config) string {
 	return cfg.Routing.Default
 }
 
+func runAgent(cmd *cobra.Command, prompt, mode string, writable bool) error {
+	env, err := loadRuntime(writable)
+	if err != nil {
+		return err
+	}
+	if err := env.prov.Ping(cmd.Context()); err != nil {
+		return err
+	}
+	if mode == "" {
+		mode = modeOrDefault(env.cfg)
+	}
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
+	defer stop()
+	_, err = env.agent().Run(ctx, agent.RunOptions{
+		Prompt:  prompt,
+		Mode:    mode,
+		Model:   flagModel,
+		Context: flagContext,
+	})
+	return err
+}
+
 func newAskCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ask [prompt...]",
-		Short: "One-shot question (uses repo tools when inside a git repo)",
+		Short: "One-shot question (repo tools; add --write to allow patches)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			prompt := strings.Join(args, " ")
-			env, err := loadRuntime()
-			if err != nil {
-				return err
-			}
-			if err := env.prov.Ping(cmd.Context()); err != nil {
-				return err
-			}
-			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
-			defer stop()
-			_, err = env.agent().Run(ctx, agent.RunOptions{
-				Prompt:  prompt,
-				Mode:    modeOrDefault(env.cfg),
-				Model:   flagModel,
-				Context: flagContext,
-			})
-			return err
+			return runAgent(cmd, strings.Join(args, " "), "", flagWrite)
 		},
 	}
 }
@@ -140,13 +208,6 @@ func newExplainCmd() *cobra.Command {
 		Short: "Explain a file, directory, or the repository",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			env, err := loadRuntime()
-			if err != nil {
-				return err
-			}
-			if err := env.prov.Ping(cmd.Context()); err != nil {
-				return err
-			}
 			target := "."
 			if len(args) == 1 {
 				target = args[0]
@@ -155,19 +216,59 @@ func newExplainCmd() *cobra.Command {
 				"Explain %q in this repository. Use tools to inspect it. Cover purpose, key parts, and how it fits the project. Be concise.",
 				target,
 			)
-			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
-			defer stop()
-			mode := modeOrDefault(env.cfg)
+			mode := modeOrDefault(mustCfg())
 			if flagMode == "" {
 				mode = "fast"
 			}
-			_, err = env.agent().Run(ctx, agent.RunOptions{
-				Prompt:  prompt,
-				Mode:    mode,
-				Model:   flagModel,
-				Context: flagContext,
-			})
-			return err
+			return runAgent(cmd, prompt, mode, false)
+		},
+	}
+}
+
+func newPlanCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "plan [prompt...]",
+		Short: "Create an implementation plan without changing files",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			prompt := "Create a concrete implementation plan (no code edits). Inspect the repo with tools first.\n\nTask: " + strings.Join(args, " ")
+			mode := "smart"
+			if flagMode != "" {
+				mode = flagMode
+			}
+			return runAgent(cmd, prompt, mode, false)
+		},
+	}
+}
+
+func newEditCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "edit [prompt...]",
+		Short: "Inspect repo and apply a reviewed patch",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			prompt := "Implement the following change. Inspect relevant files with tools, then apply_patch with a minimal unified diff. Summarize files changed.\n\nTask: " + strings.Join(args, " ")
+			mode := "code"
+			if flagMode != "" {
+				mode = flagMode
+			}
+			return runAgent(cmd, prompt, mode, true)
+		},
+	}
+}
+
+func newFixCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "fix [prompt...]",
+		Short: "Investigate, patch, test, and iterate",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			prompt := "Fix the problem described below. Use tools to diagnose, apply_patch to edit, then run_tests. Iterate until tests pass or you are blocked. Summarize what changed.\n\nProblem: " + strings.Join(args, " ")
+			mode := "code"
+			if flagMode != "" {
+				mode = flagMode
+			}
+			return runAgent(cmd, prompt, mode, true)
 		},
 	}
 }
@@ -177,44 +278,63 @@ func newReviewCmd() *cobra.Command {
 		Use:   "review",
 		Short: "Review the current git diff",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			env, err := loadRuntime()
-			if err != nil {
-				return err
-			}
-			if env.repo == nil {
-				return fmt.Errorf("not inside a git repository")
-			}
-			if err := env.prov.Ping(cmd.Context()); err != nil {
-				return err
-			}
 			prompt := "Review the current git working tree changes. Use git_status and git_diff. Report bugs, risks, and missing tests. Be concrete."
-			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
-			defer stop()
-			mode := modeOrDefault(env.cfg)
-			if flagMode == "" {
-				mode = "smart"
+			mode := "smart"
+			if flagMode != "" {
+				mode = flagMode
 			}
-			_, err = env.agent().Run(ctx, agent.RunOptions{
-				Prompt:  prompt,
-				Mode:    mode,
-				Model:   flagModel,
-				Context: flagContext,
-			})
-			return err
+			return runAgent(cmd, prompt, mode, false)
 		},
 	}
+}
+
+func newTestCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "test [target]",
+		Short: "Run tests and summarize failures (agent-assisted)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target := ""
+			if len(args) == 1 {
+				target = args[0]
+			}
+			prompt := "Run the test suite using run_tests"
+			if target != "" {
+				prompt += fmt.Sprintf(" with target %q", target)
+			}
+			prompt += ". Summarize failures and likely causes. Do not edit files unless asked."
+			mode := "fast"
+			if flagMode != "" {
+				mode = flagMode
+			}
+			return runAgent(cmd, prompt, mode, true)
+		},
+	}
+}
+
+func mustCfg() *config.Config {
+	cfg, err := config.Load()
+	if err != nil {
+		return config.Default()
+	}
+	return cfg
 }
 
 func newChatCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "chat",
-		Short: "Interactive repository-aware conversation",
+		Short: "Interactive terminal UI",
 		RunE:  runChat,
 	}
 }
 
 func runChat(cmd *cobra.Command, _ []string) error {
-	env, err := loadRuntime()
+	return runTerminalUI(cmd)
+}
+
+func runTerminalUI(cmd *cobra.Command) error {
+	writable := flagWrite
+	env, err := loadRuntime(writable)
 	if err != nil {
 		return err
 	}
@@ -222,82 +342,112 @@ func runChat(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("%w\nIs Ollama running? Try: ollama serve", err)
 	}
 
-	repoLabel := "(no git repo)"
+	repoLabel := "(none)"
 	if env.repo != nil {
 		repoLabel = env.repo.Name()
 	}
-	ui.Infof("LocalCode chat  ·  repo:%s  ·  Ctrl+C or /exit to quit", repoLabel)
-	ui.Infof("Commands: /mode /model /status /tools /clear /exit")
-
 	mode := modeOrDefault(env.cfg)
-	ag := env.agent()
 
-	// Multi-turn: keep appending to a shared history by wrapping agent lightly.
-	historyPromptPrefix := ""
-
-	in := bufio.NewScanner(os.Stdin)
-	in.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	for {
-		fmt.Fprint(os.Stderr, "\n> ")
-		if !in.Scan() {
-			break
+	toolNames := []string{}
+	if env.tools != nil {
+		for _, d := range env.tools.Definitions() {
+			toolNames = append(toolNames, d.Name)
 		}
-		line := strings.TrimSpace(in.Text())
-		if line == "" {
-			continue
-		}
-		lower := strings.ToLower(line)
-		switch {
-		case lower == "/exit" || lower == "/quit":
-			return nil
-		case lower == "/status":
-			printStatus(env, mode)
-			continue
-		case lower == "/tools":
-			if env.tools == nil {
-				ui.Infof("tools: disabled or no repo")
-			} else {
-				for _, d := range env.tools.Definitions() {
-					ui.Infof("  %s — %s", d.Name, d.Description)
-				}
-			}
-			continue
-		case strings.HasPrefix(lower, "/mode "):
-			mode = strings.TrimSpace(line[6:])
-			ui.Infof("mode set to %s", mode)
-			continue
-		case strings.HasPrefix(lower, "/model "):
-			flagModel = strings.TrimSpace(line[7:])
-			ui.Infof("model override: %s", flagModel)
-			continue
-		case lower == "/clear":
-			historyPromptPrefix = ""
-			ui.Infof("history cleared")
-			continue
-		}
-
-		prompt := line
-		if historyPromptPrefix != "" {
-			prompt = historyPromptPrefix + "\n\nUser: " + line
-		}
-
-		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
-		answer, err := ag.Run(ctx, agent.RunOptions{
-			Prompt:  prompt,
-			Mode:    mode,
-			Model:   flagModel,
-			Context: flagContext,
-		})
-		stop()
-		if err != nil {
-			ui.Infof("error: %v", err)
-			continue
-		}
-		// Keep a compact rolling summary for next turn (full message history is per-run for now).
-		historyPromptPrefix = trimHistory(historyPromptPrefix + "\nUser: " + line + "\nAssistant: " + answer)
 	}
-	return in.Err()
+
+	history := ""
+
+	return tui.RunInteractive(tui.Config{
+		AppName:  appDisplayName(),
+		Version:  version,
+		Repo:     repoLabel,
+		Mode:     mode,
+		Writable: writable,
+		Tools:    toolNames,
+		OnSlash: func(c string) (bool, string, string, *bool) {
+			lower := strings.ToLower(strings.TrimSpace(c))
+			switch {
+			case lower == "/status":
+				var b strings.Builder
+				fmt.Fprintf(&b, "app: %s %s\n", appDisplayName(), version)
+				fmt.Fprintf(&b, "repo: %s\n", repoLabel)
+				fmt.Fprintf(&b, "mode: %s\n", mode)
+				fmt.Fprintf(&b, "writes: %v\n", writable)
+				if env.session != nil {
+					fmt.Fprintf(&b, "session: %s\n", env.session.Dir)
+				}
+				if err := env.prov.Ping(context.Background()); err != nil {
+					fmt.Fprintf(&b, "ollama: unreachable (%v)\n", err)
+				} else {
+					b.WriteString("ollama: ok\n")
+				}
+				return true, b.String(), "", nil
+			case lower == "/tools":
+				if env.tools == nil {
+					return true, "No tools (not in a git repo, or --no-tools).", "", nil
+				}
+				var b strings.Builder
+				b.WriteString("Available tools:\n")
+				for _, d := range env.tools.Definitions() {
+					fmt.Fprintf(&b, "  • %s — %s\n", d.Name, d.Description)
+				}
+				return true, b.String(), "", nil
+			case strings.HasPrefix(lower, "/mode "):
+				mode = strings.TrimSpace(c[6:])
+				return true, "Mode set to " + mode, mode, nil
+			case lower == "/write on":
+				flagWrite = true
+				writable = true
+				env, err = loadRuntime(true)
+				if err != nil {
+					return true, "error: " + err.Error(), "", nil
+				}
+				toolNames = toolNames[:0]
+				if env.tools != nil {
+					for _, d := range env.tools.Definitions() {
+						toolNames = append(toolNames, d.Name)
+					}
+				}
+				w := true
+				return true, "Writes enabled. Patches may ask for approval (or use --yes).", "", &w
+			case lower == "/write off":
+				flagWrite = false
+				writable = false
+				env, err = loadRuntime(false)
+				if err != nil {
+					return true, "error: " + err.Error(), "", nil
+				}
+				w := false
+				return true, "Writes disabled (read-only).", "", &w
+			case lower == "/clear":
+				history = ""
+				return true, "History cleared.", "", nil
+			}
+			return false, "", "", nil
+		},
+		OnSubmit: func(ctx context.Context, text string, emit tui.Emitter) error {
+			prompt := text
+			if history != "" {
+				prompt = history + "\n\nUser: " + text
+			}
+			ag := env.agent()
+			if emit != nil {
+				ag.OnInfo = emit.Info
+				ag.OnToken = emit.Token
+			}
+			answer, err := ag.Run(ctx, agent.RunOptions{
+				Prompt:  prompt,
+				Mode:    mode,
+				Model:   flagModel,
+				Context: flagContext,
+			})
+			if err != nil {
+				return err
+			}
+			history = trimHistory(history + "\nUser: " + text + "\nAssistant: " + answer)
+			return nil
+		},
+	})
 }
 
 func trimHistory(s string) string {
@@ -313,7 +463,7 @@ func newModelsCmd() *cobra.Command {
 		Use:   "models",
 		Short: "Show model mode mappings and Ollama availability",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			env, err := loadRuntime()
+			env, err := loadRuntime(false)
 			if err != nil {
 				return err
 			}
@@ -362,7 +512,7 @@ func newStatusCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show config, provider, repo, and runtime status",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			env, err := loadRuntime()
+			env, err := loadRuntime(flagWrite)
 			if err != nil {
 				return err
 			}
@@ -381,10 +531,14 @@ func printStatus(env *runtimeEnv, mode string) {
 	fmt.Printf("provider:     %s (%s)\n", env.cfg.Provider.Type, env.cfg.Provider.BaseURL)
 	fmt.Printf("default mode: %s\n", env.cfg.Routing.Default)
 	fmt.Printf("active mode:  %s\n", mode)
+	fmt.Printf("writes:       %v (dry-run=%v yes=%v)\n", env.writable, flagDryRun, flagYes)
+	if env.session != nil {
+		fmt.Printf("session:      %s\n", env.session.Dir)
+	}
 	if env.repo != nil {
 		fmt.Printf("repo:         %s\n", env.repo.Root)
 		if env.tools != nil {
-			fmt.Printf("tools:        %d enabled (read-only)\n", len(env.tools.Definitions()))
+			fmt.Printf("tools:        %d enabled\n", len(env.tools.Definitions()))
 		}
 	} else {
 		fmt.Println("repo:         (none)")
@@ -426,7 +580,7 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version",
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Println("localcode 0.2.0-m2")
+			fmt.Println(appName, version)
 		},
 	}
 }

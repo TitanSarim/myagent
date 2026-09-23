@@ -5,16 +5,18 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/sarim/localcode/internal/config"
-	"github.com/sarim/localcode/internal/provider"
-	"github.com/sarim/localcode/internal/repo"
-	"github.com/sarim/localcode/internal/router"
-	"github.com/sarim/localcode/internal/tools"
-	"github.com/sarim/localcode/internal/ui"
-	"github.com/sarim/localcode/prompts"
+	"github.com/TitanSarim/myagent/internal/config"
+	"github.com/TitanSarim/myagent/internal/contextx"
+	"github.com/TitanSarim/myagent/internal/provider"
+	"github.com/TitanSarim/myagent/internal/repo"
+	"github.com/TitanSarim/myagent/internal/router"
+	"github.com/TitanSarim/myagent/internal/session"
+	"github.com/TitanSarim/myagent/internal/tools"
+	"github.com/TitanSarim/myagent/internal/ui"
+	"github.com/TitanSarim/myagent/prompts"
 )
 
-const DefaultMaxSteps = 12
+const DefaultMaxSteps = 16
 
 type Agent struct {
 	Provider provider.Provider
@@ -22,8 +24,40 @@ type Agent struct {
 	Config   *config.Config
 	Repo     *repo.Repo
 	Tools    *tools.Registry
+	Session  *session.Store
 	MaxSteps int
 	Verbose  bool
+	Writable bool
+	DryRun   bool
+
+	// Optional UI hooks (TUI). When set, replace default stdout/stderr printing.
+	OnInfo  func(string)
+	OnToken func(string)
+}
+
+func (a *Agent) info(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if a.OnInfo != nil {
+		a.OnInfo(msg)
+		return
+	}
+	ui.Infof("%s", msg)
+}
+
+func (a *Agent) token(s string) {
+	if a.OnToken != nil {
+		a.OnToken(s)
+		return
+	}
+	ui.StreamWrite(s)
+}
+
+func (a *Agent) newline() {
+	if a.OnToken != nil {
+		a.OnToken("\n")
+		return
+	}
+	ui.Newline()
 }
 
 type RunOptions struct {
@@ -33,7 +67,7 @@ type RunOptions struct {
 	Context int
 }
 
-func (a *Agent) systemPrompt() string {
+func (a *Agent) systemPrompt(userPrompt string) string {
 	base := strings.TrimSpace(prompts.System)
 	var b strings.Builder
 	b.WriteString(base)
@@ -41,13 +75,64 @@ func (a *Agent) systemPrompt() string {
 	if a.Repo != nil {
 		fmt.Fprintf(&b, "Repository root: %s\n", a.Repo.Root)
 		fmt.Fprintf(&b, "Repository name: %s\n", a.Repo.Name())
-		b.WriteString("You have tools to inspect this repository. Use tools before guessing about files.\n")
-		b.WriteString("Available tools: list_files, read_file, search_text, git_status, git_diff.\n")
-		b.WriteString("This session is read-only: do not claim you edited files.\n")
+		b.WriteString("Use tools before guessing about files.\n")
+		if a.Tools != nil {
+			names := make([]string, 0, len(a.Tools.Definitions()))
+			for _, d := range a.Tools.Definitions() {
+				names = append(names, d.Name)
+			}
+			fmt.Fprintf(&b, "Available tools: %s.\n", strings.Join(names, ", "))
+		}
+		if brief := contextx.BuildRepoBrief(a.Repo, userPrompt, 10); brief != "" {
+			b.WriteString("\n")
+			b.WriteString(brief)
+		}
+		if a.Writable {
+			b.WriteString("You MAY edit files using apply_patch with a valid unified diff.\n")
+			b.WriteString("After editing, prefer run_tests when appropriate.\n")
+			b.WriteString("Never claim a patch applied unless apply_patch succeeded.\n")
+			if a.DryRun {
+				b.WriteString("DRY-RUN is active: patches will be validated but not written.\n")
+			}
+		} else {
+			b.WriteString("This session is read-only: do not claim you edited files.\n")
+		}
 	} else {
 		b.WriteString("No git repository detected in the current directory.\n")
 	}
 	return b.String()
+}
+
+func (a *Agent) repoSignals() router.Signals {
+	sig := router.Signals{}
+	if a.Repo == nil {
+		return sig
+	}
+	if files, err := a.Repo.ListFiles("", 5000); err == nil {
+		sig.RepoFiles = len(files)
+	}
+	if st, err := a.Repo.Status(); err == nil {
+		for _, ln := range strings.Split(st, "\n") {
+			ln = strings.TrimSpace(ln)
+			if ln == "" || strings.HasPrefix(ln, "##") {
+				continue
+			}
+			sig.ChangedFiles++
+		}
+	}
+	return sig
+}
+
+func (a *Agent) tokenBudget(ctxTokens int) int {
+	// Reserve headroom for model reply + tool schemas.
+	if ctxTokens <= 0 {
+		ctxTokens = 8192
+	}
+	budget := (ctxTokens * 60) / 100
+	if budget < 1500 {
+		budget = 1500
+	}
+	return budget
 }
 
 func (a *Agent) Run(ctx context.Context, opt RunOptions) (string, error) {
@@ -55,7 +140,8 @@ func (a *Agent) Run(ctx context.Context, opt RunOptions) (string, error) {
 		a.MaxSteps = DefaultMaxSteps
 	}
 
-	d, err := a.Router.Select(opt.Mode, opt.Prompt)
+	sig := a.repoSignals()
+	d, err := a.Router.SelectWith(opt.Mode, opt.Prompt, sig)
 	if err != nil {
 		return "", err
 	}
@@ -71,11 +157,28 @@ func (a *Agent) Run(ctx context.Context, opt RunOptions) (string, error) {
 	if a.Repo != nil {
 		repoName = a.Repo.Name()
 	}
-	ui.Header(string(d.Mode), d.Profile.Name, d.Reason)
-	ui.Infof("repo: %s", repoName)
+	a.info("mode:%s  model:%s  (%s)", d.Mode, d.Profile.Name, d.Reason)
+	a.info("repo: %s", repoName)
+	if a.Session != nil {
+		a.info("session: %s", a.Session.Dir)
+	}
+	if a.Writable {
+		if a.DryRun {
+			a.info("writes: dry-run")
+		} else {
+			a.info("writes: enabled")
+		}
+	}
+	if a.Verbose {
+		a.info("context budget ~%d tokens (num_ctx=%d)", a.tokenBudget(d.Profile.Context), d.Profile.Context)
+	}
+
+	if a.Session != nil {
+		a.Session.LogMessage("user", opt.Prompt)
+	}
 
 	messages := []provider.Message{
-		{Role: provider.RoleSystem, Content: a.systemPrompt()},
+		{Role: provider.RoleSystem, Content: a.systemPrompt(opt.Prompt)},
 		{Role: provider.RoleUser, Content: opt.Prompt},
 	}
 
@@ -84,12 +187,16 @@ func (a *Agent) Run(ctx context.Context, opt RunOptions) (string, error) {
 		toolDefs = a.Tools.OllamaTools()
 	}
 
+	budget := a.tokenBudget(d.Profile.Context)
 	var final strings.Builder
+	var actions []string
 
 	for step := 0; step < a.MaxSteps; step++ {
 		if a.Verbose {
-			ui.Infof("agent step %d/%d", step+1, a.MaxSteps)
+			a.info("agent step %d/%d (msgs≈%d tokens)", step+1, a.MaxSteps, contextx.EstimateMessages(messages))
 		}
+
+		messages = contextx.TrimMessages(messages, budget)
 
 		ch, err := a.Provider.Chat(ctx, provider.ChatRequest{
 			Model:     d.Profile.Name,
@@ -109,7 +216,7 @@ func (a *Agent) Run(ctx context.Context, opt RunOptions) (string, error) {
 		for ev := range ch {
 			switch ev.Kind {
 			case provider.EventToken:
-				ui.StreamWrite(ev.Content)
+				a.token(ev.Content)
 				content.WriteString(ev.Content)
 			case provider.EventToolCalls:
 				toolCalls = ev.ToolCalls
@@ -117,22 +224,24 @@ func (a *Agent) Run(ctx context.Context, opt RunOptions) (string, error) {
 					content.WriteString(ev.Content)
 				}
 			case provider.EventError:
-				ui.Newline()
+				a.newline()
 				return final.String(), ev.Err
 			case provider.EventDone:
-				// continue after loop
 			}
 		}
 
 		if len(toolCalls) == 0 {
 			if content.Len() > 0 {
-				ui.Newline()
+				a.newline()
 				final.WriteString(content.String())
+				if a.Session != nil {
+					a.Session.LogMessage("assistant", content.String())
+					_ = a.Session.WriteSummary(content.String())
+				}
 			}
 			return final.String(), nil
 		}
 
-		// Record assistant tool call turn
 		messages = append(messages, provider.Message{
 			Role:      provider.RoleAssistant,
 			Content:   content.String(),
@@ -140,7 +249,7 @@ func (a *Agent) Run(ctx context.Context, opt RunOptions) (string, error) {
 		})
 
 		for _, tc := range toolCalls {
-			ui.Infof("→ %s %s", tc.Name, compactArgs(tc.Arguments))
+			a.info("→ %s %s", tc.Name, compactArgs(tc.Arguments))
 			res := a.Tools.Run(ctx, tools.Call{
 				ID:        tc.ID,
 				Name:      tc.Name,
@@ -151,20 +260,36 @@ func (a *Agent) Run(ctx context.Context, opt RunOptions) (string, error) {
 				preview = preview[:240] + "…"
 			}
 			if res.IsError {
-				ui.Infof("  ✗ %s", preview)
+				a.info("  ✗ %s", preview)
 			} else {
-				ui.Infof("  ✓ %s", oneLine(preview))
+				a.info("  ✓ %s", oneLine(preview))
+			}
+			actions = append(actions, tc.Name+": "+oneLine(res.Content))
+			if a.Session != nil {
+				a.Session.LogAction(tc.Name, res.Content)
+			}
+			// Cap huge tool payloads in the message stream.
+			toolContent := res.Content
+			if contextx.EstimateTokens(toolContent) > 2500 {
+				toolContent = toolContent[:10000] + "\n...[tool output truncated for context budget]"
 			}
 			messages = append(messages, provider.Message{
 				Role:       provider.RoleTool,
-				Content:    res.Content,
+				Content:    toolContent,
 				ToolName:   tc.Name,
 				ToolCallID: tc.ID,
 			})
 		}
+
+		if sum := contextx.SummarizeActions(actions, 400); sum != "" && step%3 == 2 {
+			messages = append(messages, provider.Message{
+				Role:    provider.RoleSystem,
+				Content: sum,
+			})
+		}
 	}
 
-	ui.Newline()
+	a.newline()
 	return final.String(), fmt.Errorf("agent step limit reached (%d)", a.MaxSteps)
 }
 
@@ -174,6 +299,10 @@ func compactArgs(args map[string]any) string {
 	}
 	parts := make([]string, 0, len(args))
 	for k, v := range args {
+		if k == "diff" {
+			parts = append(parts, "diff=<unified diff>")
+			continue
+		}
 		parts = append(parts, fmt.Sprintf("%s=%v", k, v))
 	}
 	s := strings.Join(parts, " ")

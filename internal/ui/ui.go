@@ -35,3 +35,31 @@ func StreamWrite(s string) {
 func Newline() {
 	fmt.Fprintln(Out)
 }
+
+// Splash prints the interactive terminal welcome banner.
+func Splash(appName, version, repo string, writable bool, mode string) {
+	w := ErrOut
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  ╭──────────────────────────────────────────╮")
+	fmt.Fprintf(w, "  │  %-40s │\n", appName)
+	fmt.Fprintf(w, "  │  local coding agent  ·  %-16s │\n", "v"+version)
+	fmt.Fprintln(w, "  ╰──────────────────────────────────────────╯")
+	fmt.Fprintln(w)
+	if repo != "" && repo != "(no git repo)" {
+		fmt.Fprintf(w, "  repo     %s\n", repo)
+	} else {
+		fmt.Fprintln(w, "  repo     (none — cd into a git repo)")
+	}
+	fmt.Fprintf(w, "  mode     %s\n", mode)
+	fmt.Fprintf(w, "  writes   %v\n", writable)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "  Type a request, or:")
+	fmt.Fprintln(w, "    /mode fast|smart|code|auto")
+	fmt.Fprintln(w, "    /write on|off   /tools   /status")
+	fmt.Fprintln(w, "    /exit")
+	fmt.Fprintln(w)
+}
+
+func Prompt() {
+	fmt.Fprint(ErrOut, "› ")
+}

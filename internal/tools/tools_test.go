@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sarim/localcode/internal/repo"
+	"github.com/TitanSarim/myagent/internal/repo"
 )
 
 func TestReadFileAndSearch(t *testing.T) {

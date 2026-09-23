@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/sarim/localcode/internal/repo"
+	"github.com/TitanSarim/myagent/internal/repo"
 )
 
 type SearchText struct{ Repo *repo.Repo }

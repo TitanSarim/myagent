@@ -1,61 +1,82 @@
-# LocalCode
+# myagent
 
-Local AI coding CLI (Claude Code / Codex style) powered by Qwen models via Ollama.
+**Open-source local AI coding agent** — Claude Code / Codex style, powered by Ollama + Qwen, with a bordered terminal UI.
 
-**Milestone:** M1 — chat / ask / models / status with `fast` · `smart` · `code` · `auto` routing.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://go.dev/)
+
+## One-command install
+
+### npm (recommended)
+
+```bash
+npm install -g myagent
+myagent
+```
+
+### curl (Linux / macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TitanSarim/myagent/main/scripts/install.sh | bash
+myagent
+```
+
+### Go
+
+```bash
+go install github.com/TitanSarim/myagent/cmd/localcode@latest
+# optional: symlink/rename to myagent
+```
 
 ## Requirements
 
 - [Ollama](https://ollama.com) running locally
-- Models:
-  - `qwen3.5:9b` → **fast**
-  - `qwen3.8:27b` → **smart**
-  - `qwen3.6:27b` → **code**
-- Go 1.24+ (to build)
-
-## Build
+- Models (examples): `qwen3.5:9b`, `qwen3.8:27b`, `qwen3.6:27b`
 
 ```bash
-export PATH="$HOME/.local/go/bin:$PATH"   # if Go installed to ~/.local
-cd "/home/sarim/Desktop/AI CLI"
-go build -o bin/localcode ./cmd/localcode
+ollama pull qwen3.5:9b
+ollama pull qwen3.8:27b
+ollama pull qwen3.6:27b
 ```
 
-## Quick start
+## Usage
 
 ```bash
-./bin/localcode init
-./bin/localcode models
-./bin/localcode ask --mode fast "Explain what a mutex is in one paragraph"
-./bin/localcode chat --mode auto
+myagent                 # open the terminal UI
+myagent ask "…"         # one-shot question
+myagent edit --dry-run --yes "…"
+myagent --write         # chat with file edits enabled
 ```
 
-### Flags
+### Terminal UI
 
-| Flag | Meaning |
+- Bordered chat + live **CPU / RAM / GPU** bar
+- Type `/` for commands (`/status`, `/tools`, `/mode`, …)
+- `↑` `↓` — previous prompts (auto-copy)
+- `Ctrl+↑` `Ctrl+↓` — browse chat messages (auto-copy)
+
+## Features
+
+| Area | Details |
 |------|---------|
-| `--mode fast\|smart\|code\|auto` | Model profile |
-| `--model <name>` | Override Ollama tag |
-| `--context <n>` | Override `num_ctx` |
-| `--provider-url` | Ollama base URL (default `http://127.0.0.1:11434`) |
-| `-v` | Verbose |
+| Models | `fast` / `smart` / `code` / `auto` |
+| Tools | read, search, git, `apply_patch`, `run_tests`, `run_command` |
+| Safety | path sandbox, patch approval, command policy |
+| Platforms | Linux · macOS · Windows |
 
-### Chat slash commands
+## Build from source
 
-- `/mode fast|smart|code|auto`
-- `/model <ollama-name>`
-- `/status`
-- `/clear`
-- `/exit`
+```bash
+git clone https://github.com/TitanSarim/myagent.git
+cd myagent
+go test ./...
+./scripts/install.sh myagent
+```
 
-## Config
+## Contributing
 
-Written by `localcode init` to the OS config dir:
+See [CONTRIBUTING.md](CONTRIBUTING.md). Licensed under [MIT](LICENSE).
 
-- Linux: `~/.config/localcode/config.yaml`
-- macOS: `~/Library/Application Support/localcode/config.yaml`
-- Windows: `%AppData%\localcode\config.yaml`
+## Disclaimer
 
-## Roadmap
-
-See `LOCALCODE_FULL_PLAN.md` — next up: M2 repo read tools (git + ripgrep).
+Runs models and tools on **your** machine. Review patches before applying. You are responsible for commands the agent runs.

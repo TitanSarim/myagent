@@ -1,0 +1,46 @@
+{
+  "name": "myagent",
+  "version": "0.4.0",
+  "description": "Local AI coding agent CLI (Ollama + Qwen) with a bordered terminal UI",
+  "license": "MIT",
+  "author": "TitanSarim",
+  "homepage": "https://github.com/TitanSarim/myagent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TitanSarim/myagent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TitanSarim/myagent/issues"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "coding-agent",
+    "ollama",
+    "qwen",
+    "local-llm",
+    "tui",
+    "myagent"
+  ],
+  "bin": {
+    "myagent": "npm/bin/myagent.js"
+  },
+  "scripts": {
+    "postinstall": "node npm/install.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "preferGlobal": true,
+  "files": [
+    "npm/bin/",
+    "npm/install.js",
+    "cmd/",
+    "internal/",
+    "prompts/",
+    "go.mod",
+    "go.sum",
+    "LICENSE",
+    "README.md"
+  ]
+}

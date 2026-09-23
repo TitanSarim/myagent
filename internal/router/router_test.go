@@ -5,19 +5,22 @@ import "testing"
 func TestHeuristic(t *testing.T) {
 	cases := []struct {
 		prompt string
+		sig    Signals
 		want   Mode
 	}{
-		{"what is a mutex?", ModeFast},
-		{"implement pagination for the orders API", ModeCode},
-		{"refactor the auth middleware", ModeCode},
-		{"design the architecture for a payment service", ModeSmart},
-		{"review this migration plan", ModeSmart},
-		{"fix the failing checkout test", ModeCode},
+		{"what is a mutex?", Signals{}, ModeFast},
+		{"implement pagination for the orders API", Signals{}, ModeCode},
+		{"refactor the auth middleware", Signals{}, ModeCode},
+		{"design the architecture for a payment service", Signals{}, ModeSmart},
+		{"review this migration plan", Signals{}, ModeSmart},
+		{"fix the failing checkout test", Signals{}, ModeCode},
+		{"look at this", Signals{FailingTests: 3}, ModeCode},
+		{"explain briefly", Signals{}, ModeFast},
 	}
 	for _, tc := range cases {
-		got := heuristic(tc.prompt)
+		got, _ := heuristic(tc.prompt, tc.sig)
 		if got != tc.want {
-			t.Errorf("heuristic(%q)=%s want %s", tc.prompt, got, tc.want)
+			t.Errorf("heuristic(%q,%+v)=%s want %s", tc.prompt, tc.sig, got, tc.want)
 		}
 	}
 }
