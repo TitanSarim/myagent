@@ -1,5 +1,9 @@
-bin/
-dist/
+/bin/
+/dist/
+node_modules/
+npm/bin/myagent
+npm/bin/myagent.exe
+!npm/bin/myagent.js
 *.exe
 *.test
 .DS_Store
