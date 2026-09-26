@@ -7,19 +7,17 @@
 
 ## One-command install
 
-### npm
-
-```bash
-npm install -g github:TitanSarim/myagent
-myagent
-```
-
-(Once published to the npm registry: `npm install -g myagent`)
-
-### curl (Linux / macOS)
+### curl (recommended — Linux / macOS)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/TitanSarim/myagent/main/scripts/install.sh | bash
+myagent
+```
+
+### npm (from GitHub)
+
+```bash
+npm install -g github:TitanSarim/myagent
 myagent
 ```
 
@@ -27,7 +25,6 @@ myagent
 
 ```bash
 go install github.com/TitanSarim/myagent/cmd/localcode@latest
-# optional: symlink/rename to myagent
 ```
 
 ## Requirements
